@@ -27,7 +27,7 @@ from .cache import (
 )
 from .cborsiterators import cbors2_to_samples, cbors_to_samples
 from .compat import FluidWrapper, WebDataset, WebLoader
-from .extradatasets import MockDataset, with_epoch, with_length
+from .extradatasets import MockDataset, FakeLength, ChoppedDataset, with_epoch, with_length
 from .filters import (
     Cached,
     LMDBCached,
