@@ -3,40 +3,56 @@ import gzip
 import hashlib
 import io
 import os
+import random
 import re
 import sqlite3
 import sys
+import uuid
+import warnings
 from functools import partial
 from typing import Any, BinaryIO, Dict, Optional, TypeVar, Union
 from urllib.parse import quote, urlparse
 
 import numpy as np
-from torch.utils.data import Dataset
+import torch.distributed as dist
 
-from .wids_dl import ConcurrentDownloader
+from .wids_dl import download_and_open
 from .wids_lru import LRUCache
 from .wids_mmtar import MMIndexedTar
 from .wids_specs import load_dsdesc_and_resolve, urldir
 from .wids_tar import TarFileReader, find_index_file
 
+try:
+    from torch.utils.data import Dataset, Sampler
+except ImportError:
+
+    class Dataset:
+        pass
+
+    class Sampler:
+        pass
+
+
 T = TypeVar("T")
+
+T_co = TypeVar("T_co", covariant=True)
 
 
 def compute_file_md5sum(fname: Union[str, BinaryIO], chunksize: int = 1000000) -> str:
     """Compute the md5sum of a file in chunks.
-    
+
     Parameters
     ----------
     fname : Union[str, BinaryIO]
         Filename or file object
     chunksize : int, optional
         Chunk size in bytes, by default 1000000
-    
+
     Returns
     -------
     str
         MD5 sum of the file
-    
+
     Examples
     --------
     >>> compute_file_md5sum("test.txt")
@@ -52,6 +68,7 @@ def compute_file_md5sum(fname: Union[str, BinaryIO], chunksize: int = 1000000) -
         for chunk in iter(lambda: fname.read(chunksize), b""):
             md5.update(chunk)
     return md5.hexdigest()
+
 
 def compute_file_md5sum(fname: Union[str, BinaryIO], chunksize: int = 1000000) -> str:
     """Compute the md5sum of a file in chunks."""
@@ -177,6 +194,9 @@ def default_decoder(sample: Dict[str, Any], format: Optional[Union[bool, str]] =
     return sample
 
 
+open_itfs = {}
+
+
 class IndexedTarSamples:
     """A class that accesses samples in a tar file. The tar file must follow
     WebDataset conventions. The tar file is indexed when the IndexedTarSamples
@@ -191,29 +211,51 @@ class IndexedTarSamples:
 
     def __init__(
         self,
-        tar_file,
+        *,
+        path=None,
+        stream=None,
         md5sum=None,
         expected_size=None,
-        source=None,
         use_mmap=True,
         index_file=find_index_file,
     ):
+        assert path is not None or stream is not None
+
         # Create TarFileReader object to read from tar_file
-        self.source = source
-        self.path = tar_file
+        self.path = path
+        stream = self.stream = stream or open(path, "rb")
+
+        # verify the MD5 sum
+        if md5sum is not None:
+            stream.seek(0)
+            got = compute_file_md5sum(stream)
+            assert got == md5sum, f"MD5 sum mismatch: expected {md5sum}, got {got}"
+            stream.seek(0)
+
+        # use either the mmap or the stream based implementation
         if use_mmap:
-            self.reader = MMIndexedTar(tar_file)
+            self.reader = MMIndexedTar(stream)
         else:
-            self.reader = TarFileReader(tar_file, index_file=index_file)
-        # Get list of all files in tar_file
+            self.reader = TarFileReader(stream, index_file=index_file)
+
+        # Get list of all files in stream
         all_files = self.reader.names()
+
         # Group files by key into samples
         self.samples = group_by_key(all_files)
-        if md5sum is not None:
-            got = compute_file_md5sum(tar_file)
-            assert got == md5sum, f"MD5 sum mismatch: expected {md5sum}, got {got}"
+
+        # check that the number of samples is correct
         if expected_size is not None:
-            assert len(self) == expected_size, f"Expected {expected_size} samples, got {len(self)}"
+            assert (
+                len(self) == expected_size
+            ), f"Expected {expected_size} samples, got {len(self)}"
+
+        self.uuid = str(uuid.uuid4())
+
+    def close(self):
+        self.reader.close()
+        if not self.stream.closed:
+            self.stream.close()
 
     def __len__(self):
         return len(self.samples)
@@ -236,29 +278,44 @@ class IndexedTarSamples:
         sample["__key__"] = key
         return sample
 
+    def __str__(self):
+        return f"<IndexedTarSamples-{id(self)} {self.path}>"
+
+    def __repr__(self):
+        return str(self)
+
 
 def hash_localname(dldir="/tmp/_wids_cache"):
     os.makedirs(dldir, exist_ok=True)
 
     connection = sqlite3.connect(os.path.join(dldir, "cache.db"))
     cursor = connection.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, path TEXT, checksum TEXT)")
+    cursor.execute(
+        "CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, path TEXT, checksum TEXT)"
+    )
     connection.commit()
 
     def f(shard):
         """Given a URL, return a local name for the shard."""
         if shard.startswith("pipe:"):
             # uuencode the entire URL string
-            hex32 = base64.urlsafe_b64encode(hashlib.sha256(shard.encode()).digest())[:32].decode()
+            hex32 = base64.urlsafe_b64encode(hashlib.sha256(shard.encode()).digest())[
+                :32
+            ].decode()
             return os.path.join(dldir, "pipe__" + hex32)
         else:
             # we hash the host and directory components into a 16 character string
             dirname = urldir(shard)
-            hex16 = base64.urlsafe_b64encode(hashlib.sha256(dirname.encode()).digest())[:16].decode()
+            hex16 = base64.urlsafe_b64encode(hashlib.sha256(dirname.encode()).digest())[
+                :16
+            ].decode()
             # the cache name is the concatenation of the hex16 string and the file name component of the URL
             cachename = "data__" + hex16 + "__" + os.path.basename(urlparse(shard).path)
             checksum = None
-            cursor.execute("INSERT OR REPLACE INTO cache VALUES (?, ?, ?)", (shard, cachename, checksum))
+            cursor.execute(
+                "INSERT OR REPLACE INTO cache VALUES (?, ?, ?)",
+                (shard, cachename, checksum),
+            )
             connection.commit()
             return os.path.join(dldir, cachename)
 
@@ -297,13 +354,10 @@ class LRUShards:
     are not deleted when they are no longer needed.
     """
 
-    def __init__(self, num_shards, keep=False, localname=default_localname()):
+    def __init__(self, lru_size, keep=False, localname=default_localname()):
         self.localname = localname
         # the cache contains the local name as the key and the downloaded path as the value
-        self.lru = LRUCache(num_shards, release_handler=self.release_handler)
-        # the downloader ensures that if multiple processes download the same file on this
-        # machine, only a single download takes place
-        self.downloader = ConcurrentDownloader(keep=False)
+        self.lru = LRUCache(lru_size, release_handler=self.release_handler)
         # keep statistics
         self.reset_stats()
 
@@ -314,40 +368,24 @@ class LRUShards:
     def __len__(self):
         return len(self.lru)
 
-    def items(self):
-        return self.lru.items()
-
-    def keys(self):
-        return self.lru.keys()
-
-    def values(self):
-        return self.lru.values()
-
     def release_handler(self, key, value):
-        # called back from the LRUCache when an object is released;
-        # this tells the downloader that the file is no longer needed
-        self.downloader.release(value.path)
-
-    def release(self, itf):
-        for k, v in self.lru.items():
-            if v is itf:
-                self.release_handler(k, v)
-                return
-        raise ValueError("Shard not found")
+        value.close()
 
     def clear(self):
         self.lru.clear()
 
     def get_shard(self, url):
+        assert isinstance(url, str)
         self.accesses += 1
         if url not in self.lru:
             local = self.localname(url)
-            downloaded = self.downloader.download(url, local)
-            if int(os.environ.get("WIDS_VERBOSE", 0)):
-                print("WIDS downloaded", url, local, downloaded, file=sys.stderr)
-            itf = IndexedTarSamples(downloaded, source=url)
+            with download_and_open(url, local) as stream:
+                itf = IndexedTarSamples(path=local, stream=stream)
             self.lru[url] = itf
             self.misses += 1
+            self.last_missed = True
+        else:
+            self.last_missed = False
         return self.lru[url]
 
 
@@ -400,13 +438,28 @@ class ShardListDataset(Dataset[T]):
     descriptor was loaded.
     """
 
-    def __init__(self, shards, cache_size=10, cache_dir=None, dataset_name=None, localname=None, transformations="PIL", keep=False, base=None, options=None):
+    def __init__(
+        self,
+        shards,
+        cache_size=int(1e12),
+        cache_dir=None,
+        lru_size=10,
+        dataset_name=None,
+        localname=None,
+        transformations="PIL",
+        keep=False,
+        base=None,
+        options=None,
+    ):
         """Create a ShardListDataset.
 
         Args:
             shards: a list of (filename, length) pairs or a URL pointing to a JSON descriptor file
             cache_size: the number of shards to keep in the cache
+            lru_size: the number of shards to keep in the LRU cache
             localname: a function that maps URLs to local filenames
+
+        Note that there are two caches: an on-disk directory, and an in-memory LRU cache.
         """
         if options is None:
             options = {}
@@ -441,7 +494,7 @@ class ShardListDataset(Dataset[T]):
             self.cache_dir = None
             self.localname = localname
         else:
-            # when no cachd dir or localname are given, use the cache from the environment
+            # when no cache dir or localname are given, use the cache from the environment
             self.cache_dir = os.environ.get("WIDS_CACHE", "/tmp/_wids_cache")
             self.localname = default_localname(self.cache_dir)
 
@@ -463,11 +516,14 @@ class ShardListDataset(Dataset[T]):
                 "cache:",
                 self.cache_dir,
                 file=sys.stderr,
-
             )
         self.transformations = interpret_transformations(transformations)
 
-        self.cache = LRUShards(cache_size, localname=self.localname, keep=keep)
+        if lru_size > 200:
+            warnings.warn(
+                "LRU size is very large; consider reducing it to avoid running out of file descriptors"
+            )
+        self.cache = LRUShards(lru_size, localname=self.localname, keep=keep)
 
     def add_transform(self, transform):
         """Add a transformation to the dataset."""
@@ -489,7 +545,9 @@ class ShardListDataset(Dataset[T]):
             # output a warning only once
             self.check_cache_misses = lambda: None
             print(
-                "Warning: ShardListDataset has a cache miss rate of {:.1%}%".format(misses * 100.0 / accesses)
+                "Warning: ShardListDataset has a cache miss rate of {:.1%}%".format(
+                    misses * 100.0 / accesses
+                )
             )
 
     def get_shard(self, index):
@@ -518,9 +576,10 @@ class ShardListDataset(Dataset[T]):
         # Check if we're missing the cache too often.
         self.check_cache_misses()
 
+        sample["__dataset__"] = desc.get("dataset")
+        sample["__index__"] = index
         sample["__shard__"] = desc["url"]
         sample["__shardindex__"] = inner_idx
-        sample["__dataset__"] = desc.get("dataset")
 
         # Apply transformations
         for transform in self.transformations:
@@ -533,7 +592,48 @@ class ShardListDataset(Dataset[T]):
         self.cache.clear()
 
 
-class ShardedSampler:
+def lengths_to_ranges(lengths):
+    """Convert a list of lengths to a list of ranges."""
+    ranges = []
+    start = 0
+    for length in lengths:
+        ranges.append((start, start + length))
+        start += length
+    return ranges
+
+
+def intersect_range(a, b):
+    """Return the intersection of the two half-open integer intervals."""
+    result = max(a[0], b[0]), min(a[1], b[1])
+    if result[0] >= result[1]:
+        return None
+    return result
+
+
+def intersect_ranges(rangelist, r):
+    """Return the intersection of the half-open integer interval r with the list of half-open integer intervals."""
+    result = []
+    for a in rangelist:
+        x = intersect_range(a, r)
+        if x is not None:
+            result.append(x)
+    return result
+
+
+def iterate_ranges(ranges, rng, indexshuffle=True, shardshuffle=True):
+    """Iterate over the ranges in a random order."""
+    shard_indexes = list(range(len(ranges)))
+    if shardshuffle:
+        rng.shuffle(shard_indexes)
+    for i in shard_indexes:
+        lo, hi = ranges[i]
+        sample_indexes = list(range(lo, hi))
+        if indexshuffle:
+            rng.shuffle(sample_indexes)
+        yield from sample_indexes
+
+
+class ShardListSampler(Sampler):
     """A sampler that samples consistent with a ShardListDataset.
 
     This sampler is used to sample from a ShardListDataset in a way that
@@ -551,19 +651,111 @@ class ShardedSampler:
     be added.
     """
 
-    def __init__(self, dataset, lengths=None, batch_size=1, shuffle=False):
+    def __init__(self, dataset, *, lengths=None, seed=0, shufflefirst=False):
         if lengths is None:
             lengths = list(dataset.lengths)
-        self.ranges = []
-        start = 0
-        for l in lengths:
-            self.ranges.append((start, start + l))
-            start += l
+        self.ranges = lengths_to_ranges(lengths)
+        self.seed = seed
+        self.shufflefirst = shufflefirst
+        self.epoch = 0
 
     def __iter__(self):
-        import torch
-        
-        shardperm = torch.randperm(len(self.ranges))
-        for shard in shardperm:
-            start, end = self.ranges[shard]
-            yield from (int(x) for x in torch.randperm(end - start) + start)
+        self.rng = random.Random(self.seed + 1289738273 * self.epoch)
+        shardshuffle = self.shufflefirst or self.epoch > 0
+        yield from iterate_ranges(self.ranges, self.rng, shardshuffle=shardshuffle)
+        self.epoch += 1
+
+
+ShardedSampler = ShardListSampler
+
+
+class ChunkedSampler(Sampler):
+    """A sampler that samples in chunks and then shuffles the samples within each chunk.
+
+    This preserves locality of reference while still shuffling the data.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        *,
+        num_samples=None,
+        chunksize=2000,
+        seed=0,
+        shuffle=True,
+        shufflefirst=False,
+    ):
+        if isinstance(num_samples, int):
+            lo, hi = 0, num_samples
+        elif num_samples is None:
+            lo, hi = 0, len(dataset)
+        else:
+            lo, hi = num_samples
+        self.ranges = [(i, min(i + chunksize, hi)) for i in range(lo, hi, chunksize)]
+        self.seed = seed
+        self.shuffle = shuffle
+        self.shufflefirst = shufflefirst
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        self.rng = random.Random(self.seed + 1289738273 * self.epoch)
+        shardshuffle = self.shufflefirst or self.epoch > 0
+        yield from iterate_ranges(
+            self.ranges,
+            self.rng,
+            indexshuffle=self.shuffle,
+            shardshuffle=(self.shuffle and shardshuffle),
+        )
+        self.epoch += 1
+
+
+def DistributedChunkedSampler(
+    dataset: Dataset,
+    *,
+    num_replicas: Optional[int] = None,
+    num_samples: Optional[int] = None,
+    rank: Optional[int] = None,
+    shuffle: bool = True,
+    shufflefirst: bool = False,
+    seed: int = 0,
+    drop_last: bool = None,
+    chunksize: int = 1000000,
+) -> ChunkedSampler:
+    """Return a ChunkedSampler for the current worker in distributed training.
+
+    Reverts to a simple ChunkedSampler if not running in distributed mode.
+
+    Since the split among workers takes place before the chunk shuffle,
+    workers end up with a fixed set of shards they need to download. The
+    more workers, the fewer shards are used by each worker.
+    """
+    if drop_last is not None:
+        warnings.warn(
+            "DistributedChunkedSampler does not support drop_last, thus it will be ignored"
+        )
+    if not dist.is_initialized():
+        warnings.warn(
+            "DistributedChunkedSampler is called without distributed initialized; assuming single process"
+        )
+        num_replicas = 1
+        rank = 0
+    else:
+        num_replicas = num_replicas or dist.get_world_size()
+        rank = rank or dist.get_rank()
+    assert rank >= 0 and rank < num_replicas
+
+    num_samples = num_samples or len(dataset)
+    worker_chunk = (num_samples + num_replicas - 1) // num_replicas
+    worker_start = rank * worker_chunk
+    worker_end = min(worker_start + worker_chunk, num_samples)
+    return ChunkedSampler(
+        dataset,
+        num_samples=(worker_start, worker_end),
+        chunksize=chunksize,
+        seed=seed,
+        shuffle=shuffle,
+        shufflefirst=shufflefirst,
+    )

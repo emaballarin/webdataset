@@ -1,12 +1,15 @@
 import io
 import json
 import os
+import random
 import textwrap
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import pytest
 
-from wids import wids, wids_specs
-from wids.wids import ShardedSampler, ShardListDataset
+from wids import DistributedChunkedSampler, wids, wids_specs
+from wids.wids import ChunkedSampler, ShardedSampler, ShardListDataset
 
 
 class TestIndexedTarSamples:
@@ -14,10 +17,14 @@ class TestIndexedTarSamples:
         tar_file = "testdata/ixtest.tar"
         md5sum = "3b3c0afe31e45325b7c4e6dec5235d13"
         expected_size = 10
-        self.indexed_samples = wids.IndexedTarSamples(tar_file, md5sum, expected_size)
+        self.indexed_samples = wids.IndexedTarSamples(
+            path=tar_file, md5sum=md5sum, expected_size=expected_size
+        )
 
     def test_length(self):
-        assert len(self.indexed_samples) == 10  # Update with the expected number of samples
+        assert (
+            len(self.indexed_samples) == 10
+        )  # Update with the expected number of samples
 
     def test_getitem(self):
         sample = self.indexed_samples[0]  # Update with the desired sample index
@@ -36,17 +43,16 @@ class TestLRUShards:
         assert len(lru_shards) == 1
         path = shard.path
         assert os.path.exists(path)
-        assert os.stat(path).st_nlink == 2
         shard = lru_shards.get_shard("testdata/ixtest.tar")
-        assert os.stat(path).st_nlink == 2
         # lru_shards.release(shard)
         # assert not os.path.exists(path)
 
 
-
 class TestGz:
     def test_gz(self):
-        dataset = wids.ShardListDataset([dict(url="testdata/testgz.tar", nsamples=1000)])
+        dataset = wids.ShardListDataset(
+            [dict(url="testdata/testgz.tar", nsamples=1000)]
+        )
         assert len(dataset) == 1000
         sample = dataset[0]
         assert isinstance(sample, dict)
@@ -69,14 +75,18 @@ class TestShardListDataset:
             dict(url="testdata/compressed.tar", nsamples=3),
         ]
 
-        dataset = wids.ShardListDataset(shards, cache_size=2, localname=wids.default_localname(str(tmpdir)))
+        dataset = wids.ShardListDataset(
+            shards, cache_size=2, localname=wids.default_localname(str(tmpdir))
+        )
         dataset.tmpdir = str(tmpdir)
 
         yield dataset
 
         # Clean up any resources used by the dataset after running the tests
 
-    def test_initialization(self, shard_list_dataset: wids.ShardListDataset[list[dict[str, str | int]]]):
+    def test_initialization(
+        self, shard_list_dataset: wids.ShardListDataset[list[dict[str, str | int]]]
+    ):
         assert len(shard_list_dataset.shards) == 3
         assert shard_list_dataset.lengths == [100, 100, 3]
         assert shard_list_dataset.total_length == 203
@@ -87,7 +97,6 @@ class TestShardListDataset:
     def test_getshard(self, shard_list_dataset: ShardListDataset):
         shard, _, _ = shard_list_dataset.get_shard(0)
         assert os.path.exists(shard.path)
-        assert os.stat(shard.path).st_nlink == 2
 
     def test_getitem(self, shard_list_dataset: ShardListDataset):
         # access sample in the first shard
@@ -97,7 +106,7 @@ class TestShardListDataset:
         assert sample["__key__"] == "000017"
         assert ".mp" in sample
         assert len(shard_list_dataset.cache) == 1
-        cache = set(shard_list_dataset.cache.keys())
+        cache = set(shard_list_dataset.cache.lru.keys())
         assert cache == set("testdata/mpdata.tar".split()), cache
 
         # access sample in the second shard
@@ -107,7 +116,7 @@ class TestShardListDataset:
         assert sample["__key__"] == "000090"
         assert ".ten" in sample
         assert len(shard_list_dataset.cache) == 2
-        cache = set(shard_list_dataset.cache.keys())
+        cache = set(shard_list_dataset.cache.lru.keys())
         assert cache == set("testdata/tendata.tar testdata/mpdata.tar".split()), cache
 
         # access sample in the third shard
@@ -117,8 +126,10 @@ class TestShardListDataset:
         assert sample["__key__"] == "compressed/0001"
         assert ".txt.gz" in sample
         assert len(shard_list_dataset.cache) == 2
-        cache = set(shard_list_dataset.cache.keys())
-        assert cache == set("testdata/tendata.tar testdata/compressed.tar".split()), cache
+        cache = set(shard_list_dataset.cache.lru.keys())
+        assert cache == set(
+            "testdata/tendata.tar testdata/compressed.tar".split()
+        ), cache
 
         # access sample in the third shard
         sample = shard_list_dataset[201]
@@ -127,8 +138,10 @@ class TestShardListDataset:
         assert sample["__key__"] == "compressed/0002"
         assert ".txt.gz" in sample
         assert len(shard_list_dataset.cache) == 2
-        cache = set(shard_list_dataset.cache.keys())
-        assert cache == set("testdata/tendata.tar testdata/compressed.tar".split()), cache
+        cache = set(shard_list_dataset.cache.lru.keys())
+        assert cache == set(
+            "testdata/tendata.tar testdata/compressed.tar".split()
+        ), cache
 
         # access sample in the first shard
         sample = shard_list_dataset[0]
@@ -137,8 +150,10 @@ class TestShardListDataset:
         assert sample["__key__"] == "000000"
         assert ".mp" in sample
         assert len(shard_list_dataset.cache) == 2
-        cache = set(shard_list_dataset.cache.keys())
-        assert cache == set("testdata/mpdata.tar testdata/compressed.tar".split()), cache
+        cache = set(shard_list_dataset.cache.lru.keys())
+        assert cache == set(
+            "testdata/mpdata.tar testdata/compressed.tar".split()
+        ), cache
 
         assert shard_list_dataset.get_stats() == (5, 4)
 
@@ -184,15 +199,18 @@ class TestSpecs:
         dataset = wids.ShardListDataset(stream)
         assert len(dataset) == 10
 
+
 class TestShardedSampler:
     @pytest.fixture(scope="function")
     def sharded_sampler(self):
-        dataset = wids.ShardListDataset([
-            dict(url="testdata/mpdata.tar", nsamples=100),
-            dict(url="testdata/tendata.tar", nsamples=100),
-            dict(url="testdata/compressed.tar", nsamples=3),
-        ])
-        sampler = wids.ShardedSampler(dataset, batch_size=10, shuffle=True)
+        dataset = wids.ShardListDataset(
+            [
+                dict(url="testdata/mpdata.tar", nsamples=100),
+                dict(url="testdata/tendata.tar", nsamples=100),
+                dict(url="testdata/compressed.tar", nsamples=3),
+            ]
+        )
+        sampler = wids.ShardedSampler(dataset)
         yield sampler
 
     def test_initialization(self, sharded_sampler: wids.ShardedSampler):
@@ -210,3 +228,210 @@ class TestShardedSampler:
         indexes1 = list(sharded_sampler)
         indexes2 = list(sharded_sampler)
         assert indexes1 != indexes2  # Ensure order changes with each iteration
+
+
+class TestChunkedSampler:
+    def setup_method(self):
+        self.dataset = list(range(10000))
+        self.sampler = ChunkedSampler(
+            self.dataset,
+            num_samples=5000,
+            chunksize=1000,
+            seed=0,
+            shuffle=True,
+            shufflefirst=False,
+        )
+
+    def test_init(self):
+        assert self.sampler.ranges == [
+            (0, 1000),
+            (1000, 2000),
+            (2000, 3000),
+            (3000, 4000),
+            (4000, 5000),
+        ]
+        assert self.sampler.seed == 0
+        assert self.sampler.shuffle == True
+        assert self.sampler.shufflefirst == False
+        assert self.sampler.epoch == 0
+
+    def test_set_epoch(self):
+        self.sampler.set_epoch(5)
+        assert self.sampler.epoch == 5
+
+    def test_iter(self):
+        random.seed(0)
+        samples = list(iter(self.sampler))
+        assert len(samples) == 5000
+        assert samples != list(range(5000))  # The samples should be shuffled
+
+    def test_iter_no_shuffle(self):
+        self.sampler.shuffle = False
+        samples = list(iter(self.sampler))
+        assert len(samples) == 5000
+        assert samples == list(range(5000))  # The samples should not be shuffled
+
+    def test_iter_full_range(self):
+        self.sampler = ChunkedSampler(
+            self.dataset,
+            num_samples=5000,
+            chunksize=1000,
+            seed=0,
+            shuffle=True,
+            shufflefirst=False,
+        )
+        samples = list(iter(self.sampler))
+        assert set(samples) == set(
+            range(5000)
+        )  # The samples should cover the full range
+
+    def test_iter_full_range_no_shuffle(self):
+        self.sampler = ChunkedSampler(
+            self.dataset,
+            num_samples=5000,
+            chunksize=1000,
+            seed=0,
+            shuffle=False,
+            shufflefirst=False,
+        )
+        samples = list(iter(self.sampler))
+        assert set(samples) == set(
+            range(5000)
+        )  # The samples should cover the full range
+
+    def test_num_samples_range(self):
+        self.sampler = ChunkedSampler(
+            self.dataset,
+            num_samples=(1111, 2222),
+            chunksize=1000,
+            seed=0,
+            shuffle=True,
+            shufflefirst=False,
+        )
+        samples = list(iter(self.sampler))
+        assert set(samples) == set(
+            range(1111, 2222)
+        )  # The samples should cover the range from 1111 to 2222
+
+
+# Fixture for mocking the distributed environment
+@pytest.fixture
+def mock_distributed_env():
+    def _mock_distributed_env(rank, world_size):
+        with patch("torch.distributed.init_process_group"):
+            with patch("torch.distributed.get_rank", return_value=rank):
+                with patch("torch.distributed.get_world_size", return_value=world_size):
+                    yield
+
+    return _mock_distributed_env
+
+
+# Context manager for mocking the distributed environment
+@contextmanager
+def mock_distributed_env(rank, world_size):
+    with patch("torch.distributed.init_process_group"), patch(
+        "torch.distributed.get_rank", return_value=rank
+    ), patch("torch.distributed.get_world_size", return_value=world_size), patch(
+        "torch.distributed.is_initialized", return_value=True
+    ):
+        yield
+
+
+class TestDistributedChunkedSampler:
+    def setup_method(self, method):
+        self.dataset = list(range(10000))
+        with mock_distributed_env(0, 2):
+            self.sampler = DistributedChunkedSampler(
+                self.dataset,
+                num_samples=5000,
+                chunksize=1000,
+                seed=0,
+                shuffle=True,
+                shufflefirst=False,
+            )
+
+    def test_init(self):
+        assert self.sampler.ranges == [(0, 1000), (1000, 2000), (2000, 2500)]
+        assert self.sampler.seed == 0
+        assert self.sampler.shuffle == True
+        assert self.sampler.shufflefirst == False
+        assert self.sampler.epoch == 0
+
+    def test_set_epoch(self):
+        self.sampler.set_epoch(5)
+        assert self.sampler.epoch == 5
+
+    def test_iter(self):
+        with mock_distributed_env(0, 2):
+            sampler = DistributedChunkedSampler(
+                self.dataset,
+                num_samples=5000,
+                chunksize=1000,
+                seed=0,
+                shuffle=True,
+                shufflefirst=False,
+            )
+            samples = list(iter(sampler))
+            assert len(samples) == 2500
+            assert samples != list(range(2500))  # The samples should be shuffled
+            assert set(samples) == set(
+                range(2500)
+            )  # The samples should cover the full range
+        with mock_distributed_env(1, 2):
+            sampler = DistributedChunkedSampler(
+                self.dataset,
+                num_samples=5000,
+                chunksize=1000,
+                seed=0,
+                shuffle=True,
+                shufflefirst=False,
+            )
+            samples = list(iter(sampler))
+            assert len(samples) == 2500
+            assert samples != list(range(2500, 5000))  # The samples should be shuffled
+            assert set(samples) == set(
+                range(2500, 5000)
+            )  # The samples should cover the full range
+
+    def test_iter_no_shuffle(self):
+        with mock_distributed_env(0, 2):
+            sampler = DistributedChunkedSampler(
+                self.dataset,
+                num_samples=5000,
+                chunksize=1000,
+                seed=0,
+                shuffle=False,
+                shufflefirst=False,
+            )
+            samples = list(iter(sampler))
+            assert len(samples) == 2500
+            assert samples == list(range(2500))  # The samples should not be shuffled
+
+    def test_disjoint_samples(self):
+        with mock_distributed_env(0, 2):
+            sampler1 = DistributedChunkedSampler(
+                self.dataset,
+                num_samples=5000,
+                chunksize=1000,
+                seed=0,
+                shuffle=True,
+                shufflefirst=False,
+            )
+            samples1 = set(iter(sampler1))
+
+        with mock_distributed_env(1, 2):
+            sampler2 = DistributedChunkedSampler(
+                self.dataset,
+                num_samples=5000,
+                chunksize=1000,
+                seed=0,
+                shuffle=True,
+                shufflefirst=False,
+            )
+            samples2 = set(iter(sampler2))
+
+        assert set(samples1) == set(range(2500))
+        assert set(samples2) == set(range(2500, 5000))
+        assert (
+            samples1.intersection(samples2) == set()
+        )  # The samples should be disjoint

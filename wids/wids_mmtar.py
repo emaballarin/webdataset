@@ -1,6 +1,8 @@
 import collections
+import fcntl
 import io
 import mmap
+import os
 import struct
 
 TarHeader = collections.namedtuple(
@@ -43,11 +45,25 @@ def next_header(offset, header):
 
 
 class MMIndexedTar:
-    def __init__(self, fname, index_file=None, verbose=True):
-        self.fname = fname
-        with open(fname, "rb") as file:
-            self.mmapped_file = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+    def __init__(self, fname, index_file=None, verbose=True, cleanup_callback=None):
+        self.verbose = verbose
+        self.cleanup_callback = cleanup_callback
+        if isinstance(fname, str):
+            self.stream = open(fname, "rb")
+            self.fname = fname
+        elif isinstance(fname, io.IOBase):
+            self.stream = fname
+            self.fname = None
+        self.mmapped_file = mmap.mmap(self.stream.fileno(), 0, access=mmap.ACCESS_READ)
+        if cleanup_callback:
+            cleanup_callback(fname, self.stream.fileno(), "start")
         self._build_index()
+
+    def close(self, dispose=False):
+        if self.cleanup_callback:
+            self.cleanup_callback(self.fname, self.stream.fileno(), "end")
+        self.mmapped_file.close()
+        self.stream.close()
 
     def _build_index(self):
         self.by_name = {}
@@ -102,5 +118,33 @@ class MMIndexedTar:
         fname, data = self.get_at_index(i)
         return fname, io.BytesIO(data)
 
-    def close(self):
-        self.mmapped_file.close()
+
+def keep_while_reading(fname, fd, phase, delay=0.0):
+    """This is a possible cleanup callback for cleanup_callback of MIndexedTar.
+
+    It assumes that as long as there are some readers for a file,
+    more readers may be trying to open it.
+
+    Note that on Linux, unlinking the file doesn't matter after
+    it has been mmapped. The contents will only be deleted when
+    all readers close the file. The unlinking merely makes the file
+    unavailable to new readers, since the downloader checks first
+    whether the file exists.
+    """
+    assert delay == 0.0, "delay not implemented"
+    if fd < 0 or fname is None:
+        return
+    if phase == "start":
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    elif phase == "end":
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.unlink(fname)
+        except FileNotFoundError:
+            # someone else deleted it already
+            pass
+        except BlockingIOError:
+            # we couldn't get an exclusive lock, so someone else is still reading
+            pass
+    else:
+        raise ValueError(f"Unknown phase {phase}")

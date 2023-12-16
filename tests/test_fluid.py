@@ -12,6 +12,7 @@ import webdataset as wds
 
 local_data = "testdata/imagenet-000000.tgz"
 compressed = "testdata/compressed.tar"
+remote_sample = "http://storage.googleapis.com/webdataset/testdata/sample.tgz"
 remote_loc = "http://storage.googleapis.com/webdataset/openimages/"
 remote_shards = "openimages-train-0000{00..99}.tar"
 remote_shard = "openimages-train-000321.tar"
@@ -144,6 +145,7 @@ datasets:
       - ia1-{000000..000033}.tar
 """
 
+os.environ["ALLOW_OBSOLETE"] = "1"
 
 yaml3_data = """
 prefix: pipe:curl -s -L http://storage.googleapis.com/
@@ -198,6 +200,7 @@ def test_dataset_shuffle_extract():
     """Basic WebDataset usage: shuffle, extract, and count samples."""
     ds = wds.WebDataset(local_data).shuffle(5).to_tuple("png;jpg cls")
     assert count_samples_tuple(ds) == 47
+
 
 def test_dataset_context():
     """Basic WebDataset usage: shuffle, extract, and count samples."""
@@ -540,6 +543,24 @@ def test_decoder():
         break
 
 
+def test_cache_dir(tmp_path):
+    """Test a custom decoder function."""
+
+    ds = wds.WebDataset(remote_sample, cache_dir=tmp_path)
+
+    count = 0
+    for epoch in range(3):
+        for sample in ds:
+            assert set(sample.keys()) == set(
+                "__key__ __url__ cls __local_path__ png".split()
+            )
+            assert sample["__key__"] == "10"
+            assert sample["cls"] == b"0"
+            assert sample["png"].startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00")
+            assert sample["__local_path__"].startswith(str(tmp_path))
+            break
+
+
 def test_shard_syntax():
     """Test that remote shards are correctly handled."""
     print(remote_loc, remote_shards)
@@ -795,3 +816,39 @@ def test_multimode():
     dl = torch.utils.data.DataLoader(ds, num_workers=4)
     count = count_samples_tuple(dl)
     assert count == 170 * 4, count
+
+
+def test_mcached():
+    shardname = "testdata/imagenet-000000.tgz"
+    dataset = wds.DataPipeline(
+        wds.SimpleShardList([shardname]),
+        wds.tarfile_to_samples(),
+        wds.Cached(),
+    )
+    result1 = list(iter(dataset))
+    result2 = list(iter(dataset))
+    assert len(result1) == len(result2)
+
+
+def test_lmdb_cached(tmp_path):
+    shardname = "testdata/imagenet-000000.tgz"
+    dest = os.path.join(tmp_path, "test.lmdb")
+    assert not os.path.exists(dest)
+    dataset = wds.DataPipeline(
+        wds.SimpleShardList([shardname]),
+        wds.tarfile_to_samples(),
+        wds.LMDBCached(dest),
+    )
+    result1 = list(iter(dataset))
+    assert os.path.exists(dest)
+    result2 = list(iter(dataset))
+    assert os.path.exists(dest)
+    assert len(result1) == len(result2)
+    del dataset
+    dataset = wds.DataPipeline(
+        wds.SimpleShardList([shardname]),
+        wds.tarfile_to_samples(),
+        wds.LMDBCached(dest),
+    )
+    result3 = list(iter(dataset))
+    assert len(result1) == len(result3)
