@@ -1,4 +1,4 @@
-#
+
 # Copyright (c) 2017-2021 NVIDIA CORPORATION. All rights reserved.
 # This file is part of the WebDataset library.
 # See the LICENSE file for licensing terms (BSD-style).
@@ -103,9 +103,10 @@ class Pipe:
 
     def close(self):
         """Wrap stream.close, wait for the subprocess, and handle errors."""
-        self.stream.close()
-        self.status = self.proc.wait(self.timeout)
-        self.wait_for_child()
+        if not self.stream.closed:
+            self.stream.close()
+            self.status = self.proc.wait(self.timeout)
+            self.wait_for_child()
 
     def __enter__(self):
         """Context handler."""
@@ -113,6 +114,10 @@ class Pipe:
 
     def __exit__(self, etype, value, traceback):
         """Context handler."""
+        self.close()
+
+    def __del__(self):
+        """Close the stream upon delete."""
         self.close()
 
 
@@ -186,7 +191,7 @@ def gopen_curl(url, mode="rb", bufsize=8192):
     :param bufsize: buffer size
     """
     if mode[0] == "r":
-        cmd = f"curl -f -s -L '{url}'"
+        cmd = f"curl --connect-timeout 30 --retry 30 --retry-delay 2 -f -s -L '{url}'"
         return Pipe(
             cmd,
             mode=mode,
