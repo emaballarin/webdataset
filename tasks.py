@@ -356,7 +356,7 @@ def makefaq(c):
     output = open("FAQ.md", "w")
     output.write(faq_intro)
     entries = sorted(glob.glob("faqs/[a-zA-Z]*.md"))
-    entries = sorted(glob.glob("faqs/[0-9]*.md"))
+    entries = sorted(glob.glob("faqs/[0-9]*.md"), reverse=True)
     for fname in entries:
         with open(fname) as stream:
             text = stream.read()
@@ -396,6 +396,7 @@ summarize_issue_instructions = """
     - you can include 1-2 short code examples
     - use Markdown format to format the output
     - be sure to use ```...``` and `...` consistently for all code
+    - be sure your quotes are matching and that you are using proper Markdown formatting
     - YOU MUST USE MARKDOWN FORMAT FOR YOUR OUTPUT
     - DO NOT EVER RETURN CODE BLOCKS WITHOUT SURROUNDING THEM WITH ```...```
 """
